@@ -1,124 +1,104 @@
-// =====================================================
-// FS25 Discord Channel Renamer — RoFarm Romania Edition
-// Includes Glitch keep-alive web server
-// =====================================================
+// ======================================================
+// FS25 Discord Channel Renamer (Render-safe version)
+// Auto-updates a Discord channel name with player count
+// Author: ChatGPT helper package for "RoFarm Romania"
+// ======================================================
 
-// --- Web server to keep Glitch awake ---
-const express = require("express");
-const app = express();
-
-app.get("/", (req, res) => res.send("✅ RoFarm FS25 Bot is alive and running!"));
-app.listen(3000, () => console.log("🌐 Glitch keep-alive server started on port 3000"));
-
-// --- Discord + FS25 Bot ---
-const { Client, GatewayIntentBits, ChannelType, PermissionsBitField } = require("discord.js");
+const { Client, GatewayIntentBits, ChannelType } = require("discord.js");
 const axios = require("axios");
 const fs = require("fs");
+const express = require("express");
 
-const CONFIG_PATH = "config.json";
-if (!fs.existsSync(CONFIG_PATH)) {
-  console.error("Missing config.json. Please create it (see README.md).");
-  process.exit(1);
+// ---------------------------------------------------------------------------
+// Load config from file (local fallback) and/or environment variables
+// ---------------------------------------------------------------------------
+let config = {};
+if (fs.existsSync("config.json")) {
+  try {
+    config = JSON.parse(fs.readFileSync("config.json", "utf8"));
+  } catch (err) {
+    console.error("Could not read config.json:", err);
+  }
 }
-const config = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+
+config.token = process.env.TOKEN || config.token;
+config.serverUrl = process.env.SERVER_URL || config.serverUrl;
+config.channelId = process.env.CHANNEL_ID || config.channelId;
+config.interval = Number(process.env.INTERVAL || config.interval || 60);
 
 // Basic validation
-["token", "serverUrl", "channelId", "interval"].forEach(k => {
-  if (!config[k] || String(config[k]).trim() === "") {
-    console.error(`config.json is missing "${k}". Please fill it.`);
-    process.exit(1);
-  }
-});
-
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-// --- Fetch stats from FS25 dedicated server XML ---
-async function fetchStats() {
-  const resp = await axios.get(config.serverUrl, { timeout: 8000 });
-  const xml = String(resp.data || "");
-
-  // helper for regex
-  const first = (patterns) => {
-    for (const p of patterns) {
-      const m = xml.match(p);
-      if (m) return m[1];
-    }
-    return null;
-  };
-
-  // players: look for <Slots numUsed="...">
-  let playersStr = first([
-    /<Slots[^>]*\bnumUsed\s*=\s*"(\d+)"/i,
-    /<players>\s*(\d+)\s*<\/players>/i,
-    /\bplayers\s*=\s*"(\d+)"/i,
-    /\bcurrent\s*=\s*"(\d+)"/i,
-    /\bcount\s*=\s*"(\d+)"/i
-  ]);
-
-  // fallback: count Player tags with isUsed="true"
-  if (playersStr == null) {
-    const active = xml.match(/<Player[^>]*\bisUsed\s*=\s*"true"/gi);
-    playersStr = active ? String(active.length) : "0";
-  }
-
-  // slots: look for <Slots capacity="...">
-  const slotsStr = first([
-    /<Slots[^>]*\bcapacity\s*=\s*"(\d+)"/i,
-    /<slots>\s*(\d+)\s*<\/slots>/i,
-    /\bmax\s*=\s*"(\d+)"/i,
-    /\bslots\s*=\s*"(\d+)"/i,
-    /\bcapacity\s*=\s*"(\d+)"/i
-  ]);
-
-  // server name
-  const nameStr = first([
-    /\bname\s*=\s*"([^"]+)"/i,
-    /<name>\s*([^<]+)\s*<\/name>/i
-  ]) || "FS25 Server";
-
-  const players = Number(playersStr || 0);
-  const slots = Number(slotsStr || 0);
-  return { players, slots, name: nameStr };
+if (!config.token || !config.serverUrl || !config.channelId) {
+  console.error("❌ Missing configuration (token/serverUrl/channelId)");
+  process.exit(1);
 }
 
-// --- Rename channel ---
+// ---------------------------------------------------------------------------
+// Keep-alive web server (important for Render/UptimeRobot)
+// ---------------------------------------------------------------------------
+const app = express();
+app.get("/", (req, res) => res.send("✅ RoFarm FS25 Bot is alive!"));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🌐 Keep-alive server running on port ${PORT}`));
+
+// ---------------------------------------------------------------------------
+// Discord bot setup
+// ---------------------------------------------------------------------------
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
+async function fetchStats() {
+  try {
+    const resp = await axios.get(config.serverUrl, { timeout: 8000 });
+    const xml = String(resp.data);
+
+    // Simple XML tag parser
+    const get = (tag) => {
+      const m = xml.match(new RegExp(`<${tag}[^>]*>(.*?)</${tag}>`, "i"));
+      return m ? m[1] : null;
+    };
+
+    const players = (xml.match(/<Player isUsed="true"/g) || []).length;
+    const slots = Number(get("Slots")?.match(/capacity="(\d+)"/)?.[1] || 0) || 0;
+    const name = get("name") || "FS25 Server";
+
+    return { players, slots, name };
+  } catch (err) {
+    console.error("Error fetching server stats:", err.message);
+    return null;
+  }
+}
+
 async function updateChannel() {
   try {
-    const { players, slots, name } = await fetchStats();
+    const stats = await fetchStats();
+    if (!stats) return;
+
+    const { players, slots, name } = stats;
     const channel = await client.channels.fetch(config.channelId);
 
     if (!channel) {
-      console.error("Channel not found. Check channelId and bot permissions.");
-      return;
-    }
-
-    const perms = channel.permissionsFor(client.user);
-    if (!perms?.has(PermissionsBitField.Flags.ManageChannels)) {
-      console.error("Bot lacks Manage Channels permission.");
+      console.error("❌ Channel not found. Check CHANNEL_ID and bot permissions.");
       return;
     }
 
     const newName = `🟢 Active Players - (${players}/${slots})`;
-
     if (channel.name !== newName) {
       await channel.setName(newName);
-      console.log(`[${new Date().toISOString()}] Updated channel name → ${newName}`);
+      console.log(`[${new Date().toISOString()}] ✅ Updated channel name to: ${newName}`);
     } else {
-      console.log(`[${new Date().toISOString()}] No change (${newName})`);
+      console.log(`[${new Date().toISOString()}] ℹ️ No change (${newName})`);
     }
 
-    // optional: show live stats in bot status
-    await client.user.setActivity(`${name}: ${players}/${slots}`, { type: 0 });
-
+    // Optional bot status
+    client.user.setActivity(`${name}: ${players}/${slots}`, { type: 0 });
   } catch (err) {
-    console.error("Error during update:", err.message);
+    console.error("Error updating channel:", err.message);
   }
 }
 
 client.once("ready", () => {
-  console.log(`[FS25] Bot connected as ${client.user.tag}`);
+  console.log(`[FS25] ✅ Bot connected as ${client.user.tag}`);
   updateChannel();
-  setInterval(updateChannel, Number(config.interval) * 1000);
+  setInterval(updateChannel, config.interval * 1000);
 });
 
 client.login(config.token);
